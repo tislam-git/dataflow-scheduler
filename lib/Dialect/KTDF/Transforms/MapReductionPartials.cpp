@@ -607,6 +607,339 @@ static void removeUnusedIterArgChain(ArrayRef<BlockArgument> acc_iter_args,
 }
 
 // ---------------------------------------------------------------------------
+// Lower a linalg.generic that was cloned by ReductionLoopExposure inside an
+// output-only loop nest.
+//
+// The generic lives inside an scf.for tagged {ktdf.output_only_loop} and has
+// all-outs() operands (no ins()):
+//
+//   outs[0]         = ktdf.read_from_fifo result (FIFO data slice)
+//   outs[1..ns-1]   = tensor.extract_slice of FIFO-loop carry (non-spanning)
+//   outs[ns..N-1]   = tensor.extract_slice of output-only iter_arg (spanning)
+//
+// After this rewrite:
+//   - Memref allocs are placed at stage top for every non-FIFO outs.
+//   - Non-spanning allocs are initialised from the FIFO-loop outermost seed.
+//   - Spanning allocs are initialised from their outermost seed.
+//   - The extract_slice / insert_slice pairs are replaced with
+//     memref.subview reads / in-place writes.
+//   - The generic is rebuilt as buffer-semantics (0 results).
+//   - Unused iter_args are stripped from both the output-only and FIFO loops
+//     via removeUnusedIterArgChain.
+// ---------------------------------------------------------------------------
+static LogicalResult rewriteOutputOnlyGeneric(
+    linalg::GenericOp generic_op,
+    scheduler::arch_view::GroupLocalMemory& group_local_mem,
+    const mlir::ktdf_arch::ResourceKinds& resource_kinds) {
+  auto stage = generic_op->getParentOfType<ktdf::StageOp>();
+  assert(stage && "expected enclosing ktdf.stage");
+
+  Attribute mem_space = group_local_mem.getLocalMemoryKindForStage(stage);
+  if (!mem_space) return failure();
+
+  OpBuilder builder(generic_op);
+  Location loc = generic_op.getLoc();
+
+  // --------------------------------------------------------------------------
+  // Step 1: Identify the output-only loop this generic lives in.
+  // --------------------------------------------------------------------------
+  auto out_only_loop = generic_op->getParentOfType<scf::ForOp>();
+  assert(out_only_loop && out_only_loop->hasAttr("ktdf.output_only_loop") &&
+         "rewriteOutputOnlyGeneric: generic must be inside output-only loop");
+
+  // --------------------------------------------------------------------------
+  // Step 2: Locate the FIFO data outs operand.
+  // --------------------------------------------------------------------------
+  std::optional<unsigned> fifo_idx = ktdf::findFifoInOperandIdx(generic_op);
+  if (!fifo_idx)
+    return generic_op.emitError(
+        "rewriteOutputOnlyGeneric: no FIFO data operand found");
+  Value orig_fifo_operand = ktdf::getFifoInOperand(generic_op, *fifo_idx);
+  if (auto ext = orig_fifo_operand.getDefiningOp<tensor::ExtractSliceOp>())
+    orig_fifo_operand = ext.getSource();
+  auto orig_read = orig_fifo_operand.getDefiningOp<ktdf::ReadFromFifoOp>();
+  assert(orig_read && "FIFO operand must come from a read_from_fifo");
+
+  // Convert the tensor read to a memref read at the location of orig_read
+  // (outside the output-only loop), so the FIFO slice is read once per outer
+  // iteration and shared across all inner k-iterations.
+  OpBuilder read_builder(orig_read);
+  Value new_fifo_read = ktdf::convertFromTensorToMemref(read_builder, orig_read);
+
+  // --------------------------------------------------------------------------
+  // Step 3: For each non-FIFO outs slot, detect spanning vs non-spanning.
+  //
+  //   Spanning: the out value is a tensor.extract_slice whose source is a
+  //             BlockArgument of the output-only loop (iterating over k).
+  //   Non-spanning: the out value is either a FIFO-loop BlockArgument directly
+  //             (after canonicalization folds away identity extract_slices) or
+  //             an identity tensor.extract_slice of a FIFO-loop BA.
+  //
+  // In both cases we record:
+  //   - the out_idx in the generic
+  //   - the source tensor value (before any extract_slice, i.e. the BA itself)
+  //   - the extract_slice op (nullptr for the direct-BA non-spanning case)
+  //   - whether it is spanning
+  // --------------------------------------------------------------------------
+  const unsigned num_outs = generic_op.getNumDpsInits();
+
+  struct OutSlot {
+    unsigned out_idx;
+    Value source_val;              // BA feeding the outs (spanning: output-only
+                                   // BA; non-spanning: FIFO BA)
+    tensor::ExtractSliceOp ext_op; // the extract_slice, if any (may be null)
+    bool is_spanning;
+    Value alloc;                   // filled in step 4
+  };
+
+  SmallVector<OutSlot> out_slots;
+  for (unsigned r = 0; r < num_outs; ++r) {
+    if (r == *fifo_idx) continue;
+    Value out_val = generic_op.getDpsInitOperand(r)->get();
+
+    // Case A: extract_slice (spanning or pre-canonicalization non-spanning).
+    if (auto ext = out_val.getDefiningOp<tensor::ExtractSliceOp>()) {
+      Value src = ext.getSource();
+      bool is_spanning = false;
+      if (auto ba = dyn_cast<BlockArgument>(src))
+        if (isa<scf::ForOp>(ba.getOwner()->getParentOp()) &&
+            ba.getOwner()->getParentOp() == out_only_loop.getOperation())
+          is_spanning = true;
+      out_slots.push_back({r, src, ext, is_spanning, {}});
+      continue;
+    }
+
+    // Case B: direct BlockArgument (non-spanning after canonicalization).
+    if (auto ba = dyn_cast<BlockArgument>(out_val)) {
+      out_slots.push_back({r, out_val, {}, /*is_spanning=*/false, {}});
+      continue;
+    }
+
+    return generic_op.emitError(
+        "rewriteOutputOnlyGeneric: non-FIFO outs must be extract_slice or "
+        "BlockArgument");
+  }
+
+  // --------------------------------------------------------------------------
+  // Step 4: Allocate memrefs at stage top for every non-FIFO slot.
+  //
+  //   Spanning:     alloc matches the extract_slice *source* tensor shape
+  //                 (the full k-dim accumulator, e.g. tensor<1x4x64xf16>).
+  //   Non-spanning: alloc matches the out value's tensor shape
+  //                 (e.g. tensor<1x64xf16>).
+  // --------------------------------------------------------------------------
+  builder.setInsertionPointToStart(stage.getBody());
+  for (auto& slot : out_slots) {
+    RankedTensorType src_tensor_type;
+    if (slot.is_spanning)
+      src_tensor_type = cast<RankedTensorType>(slot.source_val.getType());
+    else
+      src_tensor_type = cast<RankedTensorType>(
+          generic_op.getDpsInitOperand(slot.out_idx)->get().getType());
+    auto alloc_type =
+        MemRefType::get(src_tensor_type.getShape(),
+                        src_tensor_type.getElementType(),
+                        MemRefLayoutAttrInterface{}, mem_space);
+    slot.alloc = memref::AllocOp::create(builder, loc, alloc_type).getResult();
+  }
+
+  // --------------------------------------------------------------------------
+  // Step 5: Initialise allocs from their outermost seeds (walk the BA chain).
+  // --------------------------------------------------------------------------
+  for (auto& slot : out_slots) {
+    // Walk up through scf.for iter_arg chain to the non-BA seed.
+    Value cursor = slot.source_val;
+    Value outermost_init;
+    while (auto ba = dyn_cast<BlockArgument>(cursor)) {
+      auto for_op = dyn_cast<scf::ForOp>(ba.getOwner()->getParentOp());
+      if (!for_op) break;
+      outermost_init = for_op.getInits()[ba.getArgNumber() - 1];
+      cursor = outermost_init;
+    }
+    Value seed = outermost_init ? outermost_init : cursor;
+    OpBuilder init_builder(
+        seed.getDefiningOp()
+            ? (stage->isProperAncestor(seed.getDefiningOp())
+                   ? OpBuilder(seed.getDefiningOp())
+                   : builder)
+            : builder);
+    if (failed(lowerIterArgInitializer(seed, slot.alloc, generic_op,
+                                       init_builder, resource_kinds)))
+      return failure();
+  }
+
+  // --------------------------------------------------------------------------
+  // Step 6: Build replacement memref operands for the buffer generic.
+  //         Spanning → memref.subview at the k-slot offset from ext_op.
+  //         Non-spanning → the full alloc.
+  // --------------------------------------------------------------------------
+  builder.setInsertionPoint(generic_op);
+  SmallVector<Value> new_outs(num_outs);
+  new_outs[*fifo_idx] = new_fifo_read;
+  for (auto& slot : out_slots) {
+    if (slot.is_spanning) {
+      auto ext = slot.ext_op;
+      auto src_memref_type = cast<MemRefType>(slot.alloc.getType());
+      // KTDFToKTDFLoweringPass replaces the alloc with a
+      // dataflow.get_logical_memory_view that returns a memref WITHOUT a memory
+      // space annotation (see LogicalMemoryViewBuilder.cpp plain_type).  The
+      // memref.subview verifier requires source and result to carry the same
+      // memory space, so cast the alloc to a no-space type first; the subview
+      // result type is then also built without a memory space.
+      auto src_no_space_type =
+          MemRefType::get(src_memref_type.getShape(),
+                          src_memref_type.getElementType(),
+                          src_memref_type.getLayout());
+      Value src_no_space_val =
+          src_memref_type.getMemorySpace()
+              ? memref::MemorySpaceCastOp::create(builder, loc,
+                                                  src_no_space_type,
+                                                  slot.alloc)
+                    .getResult()
+              : slot.alloc;
+      auto sv_result_type =
+          cast<MemRefType>(memref::SubViewOp::inferResultType(
+              src_no_space_type, ext.getMixedOffsets(), ext.getMixedSizes(),
+              ext.getMixedStrides()));
+      auto subview = memref::SubViewOp::create(
+          builder, loc, sv_result_type, src_no_space_val,
+          ext.getMixedOffsets(), ext.getMixedSizes(), ext.getMixedStrides());
+      new_outs[slot.out_idx] = subview.getResult();
+    } else {
+      new_outs[slot.out_idx] = slot.alloc;
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Step 7: Clone the generic in buffer mode (0 results).
+  // --------------------------------------------------------------------------
+  ktdf::cloneLinalgGenericAsBufferOp(builder, generic_op, /*inputs=*/{},
+                                     new_outs);
+
+  // --------------------------------------------------------------------------
+  // Step 8: Replace generic tensor results and patch downstream users.
+  //
+  //   Spanning results:
+  //     - tensor.insert_slice users → replaced by the dest (the output-only
+  //       loop BA), so the loop's scf.yield still sees a tensor value; once
+  //       removeUnusedIterArgChain strips that iter_arg the yield slot also
+  //       disappears.
+  //     - write_to_fifo users → retargeted to the spanning alloc (memref).
+  //     - Remaining uses of the result → replaced by the spanning alloc.
+  //   Non-spanning results:
+  //     - All uses replaced by the non-spanning alloc (memref).
+  //   FIFO data result → replaced by new_fifo_read (memref).
+  // --------------------------------------------------------------------------
+
+  // Spanning: collect insert_slices before erasing them.
+  SmallVector<tensor::InsertSliceOp> inserts_to_erase;
+  for (auto& slot : out_slots) {
+    if (!slot.is_spanning) continue;
+    Value span_result = generic_op.getResult(slot.out_idx);
+    for (Operation* user : llvm::make_early_inc_range(span_result.getUsers()))
+      if (auto ins = dyn_cast<tensor::InsertSliceOp>(user))
+        inserts_to_erase.push_back(ins);
+  }
+  // Replace insert_slice results with their dest (the output-only BA), so the
+  // output-only yield slot still type-checks until the iter_arg is stripped.
+  for (auto ins : inserts_to_erase) {
+    ins.getResult().replaceAllUsesWith(ins.getDest());
+    ins.erase();
+  }
+
+  // Non-spanning: replace generic results with their allocs.
+  for (auto& slot : out_slots) {
+    if (slot.is_spanning) continue;
+    generic_op.getResult(slot.out_idx).replaceAllUsesWith(slot.alloc);
+  }
+
+  // FIFO data result.
+  const unsigned num_ins = generic_op.getNumDpsInputs();
+  if (*fifo_idx >= num_ins) {
+    Value fifo_result = generic_op.getResult(*fifo_idx - num_ins);
+    for (Operation* user : llvm::make_early_inc_range(fifo_result.getUsers())) {
+      if (auto ins = dyn_cast<tensor::InsertSliceOp>(user)) {
+        ins.getResult().replaceAllUsesWith(ins.getDest());
+        ins.erase();
+      }
+    }
+    fifo_result.replaceAllUsesWith(new_fifo_read);
+  }
+
+  // Spanning: patch write_to_fifo and clear remaining uses.
+  for (auto& slot : out_slots) {
+    if (!slot.is_spanning) continue;
+    Value span_result = generic_op.getResult(slot.out_idx);
+    for (Operation* user : llvm::make_early_inc_range(span_result.getUsers()))
+      if (auto w = dyn_cast<ktdf::WriteToFifoOp>(user))
+        w.getDataMutable().assign(slot.alloc);
+    span_result.replaceAllUsesWith(slot.alloc);
+  }
+
+  // Erase the tensor generic (all results replaced).
+  generic_op.erase();
+
+  // Retarget any remaining uses of the old tensor read (e.g. in out_only_loop inits)
+  // to new_fifo_read and erase orig_read before loop rebuilding.
+  if (orig_read) {
+    for (OpOperand& use :
+         llvm::make_early_inc_range(orig_read.getResult().getUses()))
+      use.set(new_fifo_read);
+    orig_read->erase();
+  }
+
+  // --------------------------------------------------------------------------
+  // Step 9: Strip unused iter_args from both the output-only loop and the
+  //         enclosing FIFO loop via removeUnusedIterArgChain.
+  //
+  //   All iter_args of the output-only loop (including any FIFO iter_args created
+  //   by tileLinalgOp) are passed in ONE call so that the loop is rebuilt
+  //   exactly once without iter_args. Walking the chain further (from each
+  //   init) rebuilds the FIFO loop with all dropped slots.
+  // --------------------------------------------------------------------------
+
+  // Erase spanning extract_slice ops (must be done before RAUW of their source
+  // BAs so they don't see alloc operands during the rebuild).
+  for (auto& slot : out_slots) {
+    if (slot.ext_op && slot.ext_op->use_empty())
+      slot.ext_op.erase();
+  }
+
+  // Collect ALL output-only loop iter_args in iter_arg order.
+  SmallVector<BlockArgument> all_out_only_bas;
+  SmallVector<Value> all_out_only_allocs;
+
+  for (auto [ba, init] : llvm::zip(out_only_loop.getRegionIterArgs(),
+                                   out_only_loop.getInits())) {
+    Value alloc_val = nullptr;
+    for (auto& slot : out_slots) {
+      if (slot.is_spanning && slot.source_val == Value(ba)) {
+        alloc_val = slot.alloc;
+        break;
+      }
+      if (!slot.is_spanning && (init == slot.source_val)) {
+        alloc_val = slot.alloc;
+        break;
+      }
+    }
+    // If not matching a non-FIFO out_slot (e.g. the FIFO data iter_arg created by
+    // tileLinalgOp), use new_fifo_read as the replacement value.
+    if (!alloc_val)
+      alloc_val = new_fifo_read;
+
+    all_out_only_bas.push_back(ba);
+    all_out_only_allocs.push_back(alloc_val);
+  }
+
+  // Single call strips all output-only iter_arg slots and walks up to strip
+  // the corresponding FIFO iter_arg slots.
+  if (!all_out_only_bas.empty())
+    removeUnusedIterArgChain(all_out_only_bas, all_out_only_allocs);
+
+  return success();
+}
+
+// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // Lower a single reduction linalg.generic to buffer semantics.
 // `generic_op` must have at least one reduction iterator and its input must
