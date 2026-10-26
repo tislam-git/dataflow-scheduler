@@ -1540,12 +1540,22 @@ struct MapReductionPartialsPass
     auto& group_local_mem =
         device_manager.getOrCreateView<scheduler::arch_view::GroupLocalMemory>(
             *device);
+    auto& resource_kinds =
+        device_manager.getOrCreateView<mlir::ktdf_arch::ResourceKinds>(*device);
 
-    // Collect generics in two buckets.  Loop-exposed (outer-dim) generics
-    // must be processed first so their loop results are RAUW'd to alloc
-    // memrefs before the inner-dim generics are processed (which expect
-    // ins[0] to already be a memref).
-    SmallVector<linalg::GenericOp> loop_exposed, inner_dim;
+    // Collect generics in three buckets.
+    //
+    //   output_only  — cloned generics inside a {ktdf.output_only_loop} nest
+    //                  (produced by ReductionLoopExposure for output-only dims).
+    //                  Processed first: they may be nested inside the same
+    //                  FIFO-driven scf.for that carries loop_exposed generics,
+    //                  so their iter_args must be stripped before the outer
+    //                  loop_exposed pass touches the loop.
+    //   loop_exposed — outer-dim generics (outs are FIFO-loop iter_args).
+    //                  Their loop results are RAUW'd to alloc memrefs before
+    //                  inner_dim generics are processed.
+    //   inner_dim    — inner-dim generics (produced by SplitReductionInnerOuter).
+    SmallVector<linalg::GenericOp> output_only, loop_exposed, inner_dim;
     module.walk([&](linalg::GenericOp generic_op) {
       // FIXME: Current implementation leads to invalid IR when processing
       //        contractions, so skip them for now to allow matmul to pass.
@@ -1554,12 +1564,36 @@ struct MapReductionPartialsPass
       }
       if (!hasReductionIterator(generic_op)) return;
       if (generic_op.getOutputs().empty()) return;
-      auto iter_arg = dyn_cast<BlockArgument>(generic_op.getOutputs()[0]);
-      if (iter_arg && isa<scf::ForOp>(iter_arg.getOwner()->getParentOp()))
+      // Detect generics inside an output-only loop nest.
+      bool inside_output_only = false;
+      for (auto* parent = generic_op->getParentOp(); parent;
+           parent = parent->getParentOp()) {
+        if (parent->hasAttr("ktdf.output_only_loop")) {
+          inside_output_only = true;
+          break;
+        }
+        if (isa<ktdf::StageOp>(parent)) break;
+      }
+      if (inside_output_only) {
+        output_only.push_back(generic_op);
+        return;
+      }
+      // Any output may be the loop-carried one: a generic with no ins() carries
+      // its FIFO data in outs[0] and the accumulators after it.
+      if (!ktdf::getIterArgOutputIndices(generic_op).empty())
         loop_exposed.push_back(generic_op);
       else
         inner_dim.push_back(generic_op);
     });
+
+    // Process output-only generics first.
+    for (auto generic_op : output_only) {
+      if (failed(rewriteOutputOnlyGeneric(generic_op, group_local_mem,
+                                    resource_kinds))) {
+        signalPassFailure();
+        return;
+      }
+    }
 
     for (auto generic_op : loop_exposed) {
       // Find the combine before rewriteGeneric rebuilds the loop nest.  It
@@ -1578,7 +1612,8 @@ struct MapReductionPartialsPass
           res.replaceAllUsesWith(operand);
       }
 
-      if (failed(rewriteGeneric(generic_op, group_local_mem))) {
+      if (failed(rewriteGeneric(generic_op, group_local_mem,
+                                    resource_kinds))) {
         signalPassFailure();
         return;
       }
@@ -1595,8 +1630,17 @@ struct MapReductionPartialsPass
       // on its pipeline).  Emit a memref-typed read in its place so that
       // rewriteInnerDimGeneric can assume ins[0] is already a memref.
       Operation* stale_tensor_read = nullptr;
-      if (auto read_op =
-              generic_op.getInputs()[0].getDefiningOp<ktdf::ReadFromFifoOp>()) {
+      std::optional<unsigned> fifo_idx = ktdf::findFifoInOperandIdx(generic_op);
+      if (!fifo_idx || generic_op.getInputs().empty()) {
+        // No ins() to reduce from: the inner-dim rewrite cannot handle it.
+        generic_op.emitError(
+            "MapReductionPartials: an inner-dim reduction generic needs an "
+            "ins() operand");
+        signalPassFailure();
+        return;
+      }
+      if (auto read_op = ktdf::getFifoInOperand(generic_op, *fifo_idx)
+                             .getDefiningOp<ktdf::ReadFromFifoOp>()) {
         OpBuilder builder(generic_op);
         stale_tensor_read = read_op;
         Value new_read = ktdf::convertFromTensorToMemref(builder, read_op);
