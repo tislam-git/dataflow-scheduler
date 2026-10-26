@@ -40,6 +40,9 @@ namespace mlir::ktdf {
 // findInnerDimLoopDim
 // ---------------------------------------------------------------------------
 std::optional<unsigned> findInnerDimLoopDim(linalg::GenericOp generic_op) {
+  if (generic_op.getInputs().empty())
+    return std::nullopt;
+
   auto input_type =
       dyn_cast<RankedTensorType>(generic_op.getInputs().front().getType());
   if (!input_type) return std::nullopt;
@@ -54,6 +57,40 @@ std::optional<unsigned> findInnerDimLoopDim(linalg::GenericOp generic_op) {
   auto iter_types = generic_op.getIteratorTypesArray();
   if (iter_types[loop_dim] == utils::IteratorType::reduction) return loop_dim;
   return std::nullopt;
+}
+
+// ---------------------------------------------------------------------------
+// findFifoInOperandIdx / getFifoInOperand
+// ---------------------------------------------------------------------------
+std::optional<unsigned> findFifoInOperandIdx(linalg::GenericOp generic_op) {
+  unsigned num_inputs = generic_op.getInputs().size();
+  if (num_inputs > 0) return 0;
+  for (auto [i, out] : llvm::enumerate(generic_op.getOutputs())) {
+    Value base = out;
+    if (auto slice = base.getDefiningOp<tensor::ExtractSliceOp>())
+      base = slice.getSource();
+    if (base.getDefiningOp<ktdf::ReadFromFifoOp>()) return num_inputs + i;
+  }
+  return std::nullopt;
+}
+
+Value getFifoInOperand(linalg::GenericOp generic_op, unsigned idx) {
+  unsigned num_inputs = generic_op.getInputs().size();
+  return idx < num_inputs ? generic_op.getInputs()[idx]
+                          : generic_op.getOutputs()[idx - num_inputs];
+}
+
+// ---------------------------------------------------------------------------
+// getIterArgOutputIndices
+// ---------------------------------------------------------------------------
+SmallVector<unsigned> getIterArgOutputIndices(linalg::GenericOp generic_op) {
+  SmallVector<unsigned> indices;
+  for (auto [i, out] : llvm::enumerate(generic_op.getOutputs())) {
+    auto arg = dyn_cast<BlockArgument>(out);
+    if (arg && isa<scf::ForOp>(arg.getOwner()->getParentOp()))
+      indices.push_back(i);
+  }
+  return indices;
 }
 
 // ---------------------------------------------------------------------------
