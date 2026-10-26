@@ -62,6 +62,27 @@ namespace mlir::ktdf {
 std::optional<unsigned> findInnerDimLoopDim(linalg::GenericOp generic_op);
 
 // ---------------------------------------------------------------------------
+// Index (into [ins..., outs...]) of the operand fed from the input FIFO.  With
+// a non-empty ins() this is the first input (the pre-existing convention; it is
+// not checked against a read_from_fifo).  A generic with an empty ins() (e.g.
+// a top-k whose data tensor is also updated in place) carries it in outs()
+// instead, as the operand produced by a ktdf.read_from_fifo.  Returns
+// std::nullopt when no such operand exists.
+// ---------------------------------------------------------------------------
+std::optional<unsigned> findFifoInOperandIdx(linalg::GenericOp generic_op);
+
+// The operand at `idx` in [ins..., outs...] (see findFifoInOperandIdx).
+Value getFifoInOperand(linalg::GenericOp generic_op, unsigned idx);
+
+// ---------------------------------------------------------------------------
+// Indices (into outs()) of the outputs that are loop-carried accumulators,
+// i.e. block arguments (iter_args) of an enclosing scf.for.  The remaining
+// outputs, if any, are not accumulators (e.g. the FIFO data operand of a
+// generic that has no ins()).
+// ---------------------------------------------------------------------------
+SmallVector<unsigned> getIterArgOutputIndices(linalg::GenericOp generic_op);
+
+// ---------------------------------------------------------------------------
 // Result of StageFactory::buildFifoPrivate.
 //
 // Wraps the ktdf.private op and records the begin-offset of each group of
