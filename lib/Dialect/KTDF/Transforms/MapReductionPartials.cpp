@@ -511,20 +511,35 @@ static LogicalResult lowerIterArgInitializer(
 // ---------------------------------------------------------------------------
 static void removeUnusedIterArgChain(ArrayRef<BlockArgument> acc_iter_args,
                                      ArrayRef<Value> alloc_vals) {
-  // `current` starts as the innermost iter_args, one per accumulator, and
-  // advances to their inits at each level. All of them belong to the same loop
-  // at every level, so a level is rebuilt once without all of their slots --
-  // rebuilding it once per accumulator would leave the others' block arguments
-  // pointing at a loop that is gone.
+  // `current` starts as the innermost iter_args and advances to their inits
+  // at each level.
   SmallVector<Value> current(acc_iter_args.begin(), acc_iter_args.end());
-  while (!current.empty() && isa<BlockArgument>(current.front())) {
-    auto for_op = cast<scf::ForOp>(
-        cast<BlockArgument>(current.front()).getOwner()->getParentOp());
+  SmallVector<Value> current_allocs(alloc_vals.begin(), alloc_vals.end());
+
+  while (true) {
+    // Filter to only those elements that are BlockArguments of an scf.for loop.
+    SmallVector<BlockArgument> block_args;
+    SmallVector<Value> active_allocs;
+    for (auto [val, alloc] : llvm::zip(current, current_allocs)) {
+      if (auto ba = dyn_cast<BlockArgument>(val)) {
+        if (isa<scf::ForOp>(ba.getOwner()->getParentOp())) {
+          block_args.push_back(ba);
+          active_allocs.push_back(alloc);
+        }
+      }
+    }
+    if (block_args.empty()) break;
+
+    auto for_op =
+        cast<scf::ForOp>(block_args.front().getOwner()->getParentOp());
 
     llvm::SmallDenseSet<unsigned> dropped;
     SmallVector<Value> next;
-    for (auto [k, value] : llvm::enumerate(current)) {
-      auto iter_arg = cast<BlockArgument>(value);
+    SmallVector<Value> next_allocs;
+
+    for (auto [k, iter_arg] : llvm::enumerate(block_args)) {
+      if (iter_arg.getOwner()->getParentOp() != for_op.getOperation())
+        continue;
 
       // Block arg 0 of an scf.for is the induction variable; iter_args start
       // at index 1, so subtract 1 to get the iter_arg slot index.
@@ -533,10 +548,11 @@ static void removeUnusedIterArgChain(ArrayRef<BlockArgument> acc_iter_args,
 
       // The init is what this accumulator advances to next.
       next.push_back(for_op.getInits()[iter_idx]);
+      next_allocs.push_back(active_allocs[k]);
 
       // Replace all uses of the dropped iter_arg and its loop result.
-      for_op.getResult(iter_idx).replaceAllUsesWith(alloc_vals[k]);
-      iter_arg.replaceAllUsesWith(alloc_vals[k]);
+      for_op.getResult(iter_idx).replaceAllUsesWith(active_allocs[k]);
+      iter_arg.replaceAllUsesWith(active_allocs[k]);
     }
 
     // Rebuild the loop without the dropped iter_args.
@@ -563,10 +579,12 @@ static void removeUnusedIterArgChain(ArrayRef<BlockArgument> acc_iter_args,
       if (!dropped.contains(i))
         body_map.map(arg, new_for.getRegionIterArgs()[new_arg_idx++]);
 
-    // Copy old scf.for yield operands, skipping the dropped ones.
+    // Ensure the new_for body is empty (clearing any default yield added by
+    // scf::ForOp::build when iterArgs is empty) before cloning into it.
     auto* old_yield = for_op.getBody()->getTerminator();
-    Operation* new_yield = new_for.getBody()->getTerminator();
-    OpBuilder body_builder(new_yield);
+    new_for.getBody()->clear();
+
+    OpBuilder body_builder(new_for.getBody(), new_for.getBody()->end());
     for (auto& op : for_op.getBody()->without_terminator())
       body_builder.clone(op, body_map);
 
@@ -574,7 +592,7 @@ static void removeUnusedIterArgChain(ArrayRef<BlockArgument> acc_iter_args,
     for (auto [i, operand] : llvm::enumerate(old_yield->getOperands()))
       if (!dropped.contains(i))
         new_yield_operands.push_back(body_map.lookupOrDefault(operand));
-    new_yield->setOperands(new_yield_operands);
+    scf::YieldOp::create(body_builder, loc, new_yield_operands);
 
     unsigned new_res_idx = 0;
     for (auto [i, res] : llvm::enumerate(for_op.getResults()))
@@ -583,6 +601,7 @@ static void removeUnusedIterArgChain(ArrayRef<BlockArgument> acc_iter_args,
 
     // Advance to the next parent loop in the iter arg chain.
     current = next;
+    current_allocs = next_allocs;
     for_op.erase();
   }
 }
