@@ -348,7 +348,7 @@ NestedForResult buildNestedForLoops(OpBuilder& builder, Location loc,
 // linalg.generic inputs in `compute_stage`.  When there is only one FIFO-dest
 // transfer the choice is trivial.  When there are several (e.g. a main-input
 // transfer and a conditional accumulator transfer) we identify the right one by
-// tracing generic_op.getInputs().front() back to its ReadFromFifoOp and
+// tracing the generic's data operand back to its ReadFromFifoOp and
 // matching on the FIFO slot value.
 //
 // Returns the destination Value of the chosen transfer, or a null Value and
@@ -374,7 +374,13 @@ Value findFifoInTransfer(ktdf::PipelineOp inner_pipeline,
 
   // Multiple FIFO-dest transfers: identify the one whose destination matches
   // the FIFO slot consumed by linalg.generic ins().
-  Value generic_input = generic_op.getInputs().front();
+  std::optional<unsigned> data_idx = findFifoInOperandIdx(generic_op);
+  if (!data_idx) {
+    inner_pipeline.emitError(PASS_NAME
+                             ": linalg.generic has no read_from_fifo operand");
+    return {};
+  }
+  Value generic_input = getFifoInOperand(generic_op, *data_idx);
 
   // The input to linalg.generic must be directly produced by a read_from_fifo.
   auto read_op = generic_input.getDefiningOp<ktdf::ReadFromFifoOp>();
