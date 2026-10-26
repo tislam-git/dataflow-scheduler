@@ -87,8 +87,11 @@
 #include "dataflow-scheduler/Analysis/ArchViews/GroupLocalMemory.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDF/Transforms/Passes.h"
+#include "dataflow-scheduler/Dialect/KTDF/Transforms/ReductionUtils.h"
 #include "dataflow-scheduler/Dialect/KTDF/Utils/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
+#include "dataflow-scheduler/Dialect/KTDFArch/Analysis/ResourceKinds.h"
+#include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchIntrinsics.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -222,6 +225,144 @@ static FailureOr<TypedAttr> getNeutralAttr(linalg::GenericOp generic_op,
 }
 
 // ---------------------------------------------------------------------------
+// Return the number of SIMD lanes the compute unit of `stage` has for
+// `elem_type` -- the width of one register of the accumulator -- or 0 when the
+// device does not say.
+// ---------------------------------------------------------------------------
+static int64_t getStageLanes(
+    ktdf::StageOp stage, Type elem_type,
+    const mlir::ktdf_arch::ResourceKinds& resource_kinds) {
+  const auto units = stage ? stage.getApplicableUnits() : std::nullopt;
+  if (!units || units->size() != 1) return 0;
+  auto kind = dyn_cast<mlir::ktdf_arch::KindAttr>(units->getValue().front());
+  if (!kind) return 0;
+  auto simd = resource_kinds.getFeature<mlir::ktdf_arch::feature::SIMD>(kind);
+  return simd ? simd.getLanes(elem_type) : 0;
+}
+
+// ---------------------------------------------------------------------------
+// Return the shape of a contiguous tile of `lanes` elements that `shape`
+// divides into evenly.  The tile takes whole innermost dimensions until the
+// next one only partly fits; that one is split, and the outer ones are 1:
+//
+//   shape = [1, 4, 64], lanes = 64  →  [1, 1, 64]
+//   shape = [2, 8, 16], lanes = 64  →  [1, 4, 16]
+//
+// Fails when a dimension neither divides nor is divided by what remains of
+// the tile, or when `shape` holds fewer than `lanes` elements.
+// ---------------------------------------------------------------------------
+static FailureOr<SmallVector<int64_t>> getLaneTileShape(
+    ArrayRef<int64_t> shape, int64_t lanes) {
+  SmallVector<int64_t> tile(shape.size(), 1);
+  int64_t remaining = lanes;
+  for (int64_t d = static_cast<int64_t>(shape.size()) - 1;
+       d >= 0 && remaining > 1; --d) {
+    if (remaining % shape[d] == 0) {
+      tile[d] = shape[d];
+      remaining /= shape[d];
+    } else if (shape[d] % remaining == 0) {
+      tile[d] = remaining;
+      remaining = 1;
+    } else {
+      return failure();
+    }
+  }
+  if (remaining != 1) return failure();
+  return tile;
+}
+
+// ---------------------------------------------------------------------------
+// Give the accumulator `alloc_val` the value `init_val`.
+//
+// The value goes to a buffer of its own and the accumulator is copied from
+// it; the accumulator is never filled directly.  A buffer written once and
+// never read back is invariant, so what hoists such a write can lift it to
+// where a register is initialised instead -- which carries the whole value.
+//
+// That buffer stays live for as long as the accumulator does, so it is only
+// ever one register (`lanes` elements) wide.  When the device declares no lanes
+// for the element type the register width is unknown, and the buffer is as
+// wide as the accumulator:
+//
+//   accumulator of at most `lanes` elements → one memref.copy:
+//     %init = memref.alloc() : memref<1x64xf16, ms>
+//     linalg.fill ins(%cst) outs(%init)
+//     memref.copy %init, %alloc
+//
+//   wider accumulator → the buffer is broadcast, one copy per lane-sized tile:
+//     %init = memref.alloc() : memref<1x1x64xf16, ms>
+//     linalg.fill ins(%cst) outs(%init)
+//     %plain = memref.memory_space_cast %alloc : ... to memref<1x4x64xf16>
+//     %sv_i = memref.subview %plain[0, i, 0] [1, 1, 64] [1, 1, 1]
+//     memref.copy %init, %sv_i                     // for i in 0..3
+// ---------------------------------------------------------------------------
+static LogicalResult materializeInitialValue(OpBuilder& builder, Location loc,
+                                             Value init_val, Value alloc_val,
+                                             int64_t lanes) {
+  auto alloc_type = cast<MemRefType>(alloc_val.getType());
+  if (!alloc_type.hasStaticShape())
+    return emitError(loc,
+                     "MapReductionPartials: accumulator must have a static "
+                     "shape to be initialised");
+  const int64_t elements = alloc_type.getNumElements();
+
+  // ── Copy: the accumulator fits in one register ────────────────────────────
+  if (lanes <= 0 || elements <= lanes) {
+    auto init = memref::AllocOp::create(builder, loc, alloc_type);
+    linalg::FillOp::create(builder, loc, ValueRange{init_val},
+                           ValueRange{init.getResult()});
+    memref::CopyOp::create(builder, loc, init.getResult(), alloc_val);
+    return success();
+  }
+
+  // ── Broadcast: one register copied into each lane-sized tile ──────────────
+  ArrayRef<int64_t> shape = alloc_type.getShape();
+  FailureOr<SmallVector<int64_t>> tile = getLaneTileShape(shape, lanes);
+  if (failed(tile))
+    return emitError(loc, "MapReductionPartials: accumulator ")
+           << alloc_type << " does not divide into contiguous tiles of "
+           << lanes << " lanes to broadcast its initial value over";
+
+  auto init_type =
+      MemRefType::get(*tile, alloc_type.getElementType(),
+                      MemRefLayoutAttrInterface{}, alloc_type.getMemorySpace());
+  auto init = memref::AllocOp::create(builder, loc, init_type);
+  linalg::FillOp::create(builder, loc, ValueRange{init_val},
+                         ValueRange{init.getResult()});
+
+  // KTDFToKTDFLoweringPass replaces the alloc with a view that carries no
+  // memory space, and memref.subview requires its source and result to agree
+  // on one, so subview a cast of the alloc (as rewriteOutputOnlyGeneric does).
+  Value plain = alloc_val;
+  if (alloc_type.getMemorySpace())
+    plain = memref::MemorySpaceCastOp::create(
+                builder, loc,
+                MemRefType::get(shape, alloc_type.getElementType(),
+                                alloc_type.getLayout()),
+                alloc_val)
+                .getResult();
+
+  const int64_t rank = alloc_type.getRank();
+  SmallVector<int64_t> tiles_per_dim(rank);
+  for (int64_t d = 0; d < rank; ++d) tiles_per_dim[d] = shape[d] / (*tile)[d];
+  const SmallVector<int64_t> strides(rank, 1);
+
+  for (int64_t t = 0, e = elements / lanes; t < e; ++t) {
+    SmallVector<int64_t> offsets(rank);
+    int64_t rest = t;
+    for (int64_t d = rank - 1; d >= 0; --d) {
+      offsets[d] = (rest % tiles_per_dim[d]) * (*tile)[d];
+      rest /= tiles_per_dim[d];
+    }
+    auto subview =
+        memref::SubViewOp::create(builder, loc, plain, offsets, *tile, strides);
+    memref::CopyOp::create(builder, loc, init.getResult(),
+                           subview.getResult());
+  }
+  return success();
+}
+
+// ---------------------------------------------------------------------------
 // Transform the initializer `init_val` of a loop-carried accumulator in-place,
 // emitting linalg.fill (or memref.copy) into `alloc_val` wherever the original
 // tensor value was produced.  `alloc_val` is a memref.alloc already emitted at
@@ -245,44 +386,63 @@ static FailureOr<TypedAttr> getNeutralAttr(linalg::GenericOp generic_op,
 //       operand 0), drop the yield operands so both yields become result-less,
 //       then rebuild the scf.if with no result types.
 // ---------------------------------------------------------------------------
-static LogicalResult lowerIterArgInitializer(Value init_val, Value alloc_val,
-                                             linalg::GenericOp generic_op) {
+static LogicalResult lowerIterArgInitializer(
+    Value init_val, Value alloc_val, linalg::GenericOp generic_op,
+    OpBuilder& builder,
+    const mlir::ktdf_arch::ResourceKinds& resource_kinds) {
   Operation* defining_op = init_val.getDefiningOp();
   assert(defining_op &&
          "lowerIterArgInitializer: init_val must be an op result");
 
   Type elem_type = cast<MemRefType>(alloc_val.getType()).getElementType();
 
+  // The width of the register an initial value is held in.
+  const int64_t lanes = getStageLanes(
+      generic_op->getParentOfType<ktdf::StageOp>(), elem_type, resource_kinds);
+
   // ── Case: tensor.empty ────────────────────────────────────────────────────
   if (auto empty_op = dyn_cast<tensor::EmptyOp>(defining_op)) {
     auto neutral = getNeutralAttr(generic_op, elem_type);
     if (failed(neutral)) return failure();
-    OpBuilder builder(empty_op);
     Location loc = empty_op.getLoc();
     Value neutral_val =
         arith::ConstantOp::create(builder, loc, neutral.value());
 
-    // The identity goes to a buffer of its own, which the accumulator is then
-    // copied from. Filling the accumulator directly would put the value in the
-    // copy instruction's immediate, and that field is too narrow for a 32-bit
-    // one. A buffer written once and never read back is invariant, so what
-    // hoists such a write can lift it to where a register is initialised
-    // instead -- which carries the whole value.
-    auto identity = memref::AllocOp::create(
-        builder, loc, cast<MemRefType>(alloc_val.getType()));
-    linalg::FillOp::create(builder, loc, ValueRange{neutral_val},
-                           ValueRange{identity.getResult()});
-    memref::CopyOp::create(builder, loc, identity.getResult(), alloc_val);
+    if (failed(materializeInitialValue(builder, loc, neutral_val, alloc_val,
+                                       lanes)))
+      return failure();
 
-    empty_op->erase();
+    if (empty_op->use_empty()) empty_op->erase();
+    return success();
+  }
+
+  // ── Case: arith.constant splat tensor ─────────────────────────────────────
+  // The user-specified initial value is kept (not the combiner's neutral
+  // element). Materialise it the same way as the tensor.empty case.
+  if (auto const_op = dyn_cast<arith::ConstantOp>(defining_op)) {
+    auto dense = dyn_cast<DenseElementsAttr>(const_op.getValue());
+    if (!dense || !dense.isSplat() ||
+        dense.getElementType() != elem_type)
+      return const_op->emitError(
+          "lowerIterArgInitializer: arith.constant initializer must be a "
+          "splat tensor whose element type matches the accumulator");
+    Location loc = const_op.getLoc();
+    Value splat_val = arith::ConstantOp::create(
+        builder, loc, cast<TypedAttr>(dense.getSplatValue<Attribute>()));
+    if (failed(materializeInitialValue(builder, loc, splat_val, alloc_val,
+                                       lanes)))
+      return failure();
+
+    // The constant may be shared; only erase it when nothing else uses it.
+    if (const_op->use_empty()) const_op->erase();
     return success();
   }
 
   // ── Case: ktdf.read_from_fifo returning a tensor ──────────────────────────
   if (auto read_op = dyn_cast<ktdf::ReadFromFifoOp>(defining_op)) {
-    OpBuilder builder(read_op);
-    Value new_read = ktdf::convertFromTensorToMemref(builder, read_op);
-    memref::CopyOp::create(builder, read_op.getLoc(), new_read, alloc_val);
+    OpBuilder read_builder(read_op);
+    Value new_read = ktdf::convertFromTensorToMemref(read_builder, read_op);
+    memref::CopyOp::create(read_builder, read_op.getLoc(), new_read, alloc_val);
     read_op->erase();
     return success();
   }
@@ -296,7 +456,9 @@ static LogicalResult lowerIterArgInitializer(Value init_val, Value alloc_val,
           cast<scf::YieldOp>(if_op.getThenRegion().front().getTerminator());
       Value then_init = then_yield.getOperand(0);
       then_yield->setOperands({});
-      if (failed(lowerIterArgInitializer(then_init, alloc_val, generic_op)))
+      OpBuilder then_builder(then_yield);
+      if (failed(lowerIterArgInitializer(then_init, alloc_val, generic_op,
+                                         then_builder, resource_kinds)))
         return failure();
     }
 
@@ -305,7 +467,9 @@ static LogicalResult lowerIterArgInitializer(Value init_val, Value alloc_val,
           cast<scf::YieldOp>(if_op.getElseRegion().front().getTerminator());
       Value else_init = else_yield.getOperand(0);
       else_yield->setOperands({});
-      if (failed(lowerIterArgInitializer(else_init, alloc_val, generic_op)))
+      OpBuilder else_builder(else_yield);
+      if (failed(lowerIterArgInitializer(else_init, alloc_val, generic_op,
+                                         else_builder, resource_kinds)))
         return failure();
     }
 
