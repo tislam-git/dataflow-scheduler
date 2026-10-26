@@ -254,6 +254,13 @@ struct LowerLinalgGenericPattern
   }
 
  private:
+  /// Whether \p operand is a fifo read, or the vector that read was replaced
+  /// by: a value rather than a buffer.
+  static bool isFifoFed(mlir::Value operand) {
+    return !mlir::isa<mlir::MemRefType>(operand.getType()) ||
+           operand.getDefiningOp<mlir::ktdf::ReadFromFifoOp>();
+  }
+
   // Lowers a linalg.generic with buffer semantics (memref init operand).
   // The resulting accumulated vector is written back to the output buffer via
   // agen.vector_store.
@@ -281,11 +288,17 @@ struct LowerLinalgGenericPattern
     // no address, and LowerReadFromFifoPattern replaces that read with the
     // vector a dataflow.receive yields.  Loading from it would only be undone
     // when that replacement rewrites the load's own operand.
+    //
+    // This pattern can fail part-way (a body store of a fifo read is not yet a
+    // vector store) and be tried again once the read has been replaced. A block
+    // argument with no uses was replaced by the first try, so it is skipped
+    // rather than loaded a second time.
     unsigned num_inputs = generic_op.getNumDpsInputs();
     rewriter.setInsertionPoint(generic_op);
     for (auto [block_arg, input] :
          llvm::zip(body.getArguments().take_front(num_inputs),
                    generic_op.getDpsInputs())) {
+      if (block_arg.use_empty()) continue;
       mlir::Value operand = input;
       auto memref_type = mlir::dyn_cast<mlir::MemRefType>(input.getType());
       if (memref_type && !input.getDefiningOp<mlir::ktdf::ReadFromFifoOp>()) {
@@ -300,17 +313,32 @@ struct LowerLinalgGenericPattern
     // holds. Read each into a vector and let the body read that instead. There
     // is one per result: a compute that accumulates more than one thing
     // accumulates into two.
+    //
+    // An output that a ktdf.read_from_fifo hands out is the exception, for the
+    // same reason as an input above: it holds no address, and its read becomes
+    // the received vector, which is already the value the body wants. It is
+    // also not written back below -- there is no buffer behind it. Once that
+    // read has been replaced the output is the vector itself, which is the
+    // same case.
     llvm::SmallVector<mlir::Value> out_memrefs;
     for (unsigned r = 0; r < accumulators; ++r) {
       mlir::Value out_memref = generic_op.getDpsInitOperand(r)->get();
       out_memrefs.push_back(out_memref);
+
+      mlir::BlockArgument acc_arg = body.getArgument(num_inputs + r);
+      if (acc_arg.use_empty()) continue;
+
+      if (isFifoFed(out_memref)) {
+        rewriter.replaceAllUsesWith(acc_arg, out_memref);
+        continue;
+      }
 
       auto out_memref_type = mlir::cast<mlir::MemRefType>(out_memref.getType());
       auto acc_vec_type = getFlattenedVectorType(out_memref_type);
       if (!acc_vec_type) return mlir::failure();
 
       rewriter.replaceAllUsesWith(
-          body.getArgument(num_inputs + r),
+          acc_arg,
           scheduler::emitVectorLoad(rewriter, loc, acc_vec_type, out_memref));
     }
 
@@ -402,8 +430,10 @@ struct LowerLinalgGenericPattern
       if (mlir::failed(result)) return mlir::failure();
     }
 
-    // Write each accumulated vector back to the buffer it came from.
+    // Write each accumulated vector back to the buffer it came from. A fifo
+    // read has no buffer to write back to.
     for (unsigned r = 0; r < accumulators; ++r) {
+      if (isFifoFed(out_memrefs[r])) continue;
       scheduler::emitVectorStore(rewriter, loc, yield_op.getOperand(r),
                                  out_memrefs[r]);
     }
