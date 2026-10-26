@@ -947,7 +947,8 @@ static LogicalResult rewriteOutputOnlyGeneric(
 // ---------------------------------------------------------------------------
 static LogicalResult rewriteGeneric(
     linalg::GenericOp generic_op,
-    scheduler::arch_view::GroupLocalMemory& group_local_mem) {
+    scheduler::arch_view::GroupLocalMemory& group_local_mem,
+    const mlir::ktdf_arch::ResourceKinds& resource_kinds) {
   auto stage = generic_op->getParentOfType<ktdf::StageOp>();
   assert(stage && "expected enclosing ktdf.stage");
 
@@ -958,17 +959,20 @@ static LogicalResult rewriteGeneric(
   OpBuilder builder(generic_op);
   Location loc = generic_op.getLoc();
 
-  // One accumulator per result: a compute that accumulates more than one thing
-  // has one of each, and each is buffered on its own.
-  const unsigned accumulators =
-      static_cast<unsigned>(generic_op.getOutputs().size());
+  // One accumulator per loop-carried output: a compute that accumulates more
+  // than one thing has one of each, and each is buffered on its own.  The
+  // outputs that are not iter_args (e.g. the FIFO data operand of a generic with
+  // no ins()) are not accumulators and are left alone.
+  const SmallVector<unsigned> acc_out_idx =
+      ktdf::getIterArgOutputIndices(generic_op);
+  const unsigned accumulators = static_cast<unsigned>(acc_out_idx.size());
 
   // Step 2: allocate an accumulator memref per result at the top of the stage.
   builder.setInsertionPointToStart(stage.getBody());
   SmallVector<Value> allocs;
   for (unsigned r = 0; r < accumulators; ++r) {
     auto out_tensor_type = cast<RankedTensorType>(
-        generic_op.getDpsInitOperand(r)->get().getType());
+        generic_op.getDpsInitOperand(acc_out_idx[r])->get().getType());
     auto alloc_type = MemRefType::get(out_tensor_type.getShape(),
                                       out_tensor_type.getElementType(),
                                       MemRefLayoutAttrInterface{}, mem_space);
@@ -980,15 +984,10 @@ static LogicalResult rewriteGeneric(
   // of each, before anything is erased.
   SmallVector<BlockArgument> acc_iter_args;
   SmallVector<Value> outermost_inits;
+  Operation* outermost_for = nullptr;
   for (unsigned r = 0; r < accumulators; ++r) {
-    auto acc_iter_arg = dyn_cast<BlockArgument>(generic_op.getOutputs()[r]);
-    if (!acc_iter_arg ||
-        !isa<scf::ForOp>(acc_iter_arg.getOwner()->getParentOp())) {
-      return generic_op.emitError(
-                 "rewriteGeneric: every output must be an iter_arg of an "
-                 "scf.for, and output ")
-             << r << " is not";
-    }
+    auto acc_iter_arg =
+        cast<BlockArgument>(generic_op.getOutputs()[acc_out_idx[r]]);
     acc_iter_args.push_back(acc_iter_arg);
 
     Value outermost_init;
@@ -997,6 +996,7 @@ static LogicalResult rewriteGeneric(
       auto for_op = cast<scf::ForOp>(ba.getOwner()->getParentOp());
       assert(for_op);
       outermost_init = for_op.getInits()[ba.getArgNumber() - 1];
+      outermost_for = for_op;
       cursor = outermost_init;
     }
     assert(outermost_init && "could not find iter_arg initializer");
@@ -1013,34 +1013,64 @@ static LogicalResult rewriteGeneric(
   // Step 4b: lower each initializer — emit linalg.fill (and/or memref.copy) in
   // the right place and clean up tensor ops.
   for (unsigned r = 0; r < accumulators; ++r) {
-    if (failed(
-            lowerIterArgInitializer(outermost_inits[r], allocs[r], generic_op)))
+    OpBuilder init_builder =
+        (outermost_inits[r].getDefiningOp() &&
+         stage->isProperAncestor(outermost_inits[r].getDefiningOp()))
+            ? OpBuilder(outermost_inits[r].getDefiningOp())
+            : (outermost_for ? OpBuilder(outermost_for) : OpBuilder(generic_op));
+    if (failed(lowerIterArgInitializer(outermost_inits[r], allocs[r],
+                                       generic_op, init_builder,
+                                       resource_kinds)))
       return failure();
   }
 
   // Step 5: emit a new ktdf.read_from_fifo with a memref result type so the
-  // buffer-semantics linalg.generic below has a pure-buffer input.
+  // buffer-semantics linalg.generic below has a pure-buffer FIFO operand.  The
+  // FIFO operand is ins[0], or — for a generic with no ins() — the outs()
+  // operand produced by the read.
   builder.setInsertionPoint(generic_op);
-  auto orig_read =
-      generic_op.getInputs()[0].getDefiningOp<ktdf::ReadFromFifoOp>();
-  assert(orig_read && "rewriteGeneric: input[0] must be a ktdf.read_from_fifo");
+  std::optional<unsigned> fifo_idx = ktdf::findFifoInOperandIdx(generic_op);
+  if (!fifo_idx)
+    return generic_op.emitError(
+        "rewriteGeneric: no operand is fed by a ktdf.read_from_fifo");
+  Value orig_input = ktdf::getFifoInOperand(generic_op, *fifo_idx);
+  auto orig_read = orig_input.getDefiningOp<ktdf::ReadFromFifoOp>();
+  assert(orig_read &&
+         "rewriteGeneric: the FIFO operand must be a ktdf.read_from_fifo");
   Value new_read = ktdf::convertFromTensorToMemref(builder, orig_read);
 
-  // Step 6: pure-buffer linalg.generic — memref ins + memref outs, no result.
-  ktdf::cloneLinalgGenericAsBufferOp(
-      builder, generic_op, /*inputs=*/ValueRange{new_read}, /*outputs=*/allocs);
+  // Step 6: pure-buffer linalg.generic — memref operands, no result.  The new
+  // read keeps the position of the operand it replaces: ins[0] when there are
+  // ins, otherwise its slot among the outs, with the accumulator allocs in the
+  // iter_arg slots.
+  const unsigned num_ins = generic_op.getInputs().size();
+  if (num_ins > 0) {
+    ktdf::cloneLinalgGenericAsBufferOp(
+        builder, generic_op, /*inputs=*/ValueRange{new_read},
+        /*outputs=*/allocs);
+  } else {
+    SmallVector<Value> new_outs(generic_op.getOutputs());
+    new_outs[*fifo_idx - num_ins] = new_read;
+    for (auto [r, out_idx] : llvm::enumerate(acc_out_idx))
+      new_outs[out_idx] = allocs[r];
+    ktdf::cloneLinalgGenericAsBufferOp(builder, generic_op, /*inputs=*/{},
+                                       /*outputs=*/new_outs);
+  }
 
   // Step 7: replace generic result with alloc, patch write_to_fifo users,
   // then erase the generic and its now-dead tensor read_from_fifo input.
   for (unsigned r = 0; r < accumulators; ++r) {
-    Value generic_result = generic_op.getResult(r);
+    Value generic_result = generic_op.getResult(acc_out_idx[r]);
     for (Operation* user : generic_result.getUsers())
       if (auto write_op = dyn_cast<ktdf::WriteToFifoOp>(user))
         write_op.getDataMutable().assign(allocs[r]);
     generic_result.replaceAllUsesWith(allocs[r]);
   }
+  // The buffer generic writes the FIFO operand in place, so its result (if
+  // anything reads it) is now the new read.
+  if (*fifo_idx >= num_ins)
+    generic_op.getResult(*fifo_idx - num_ins).replaceAllUsesWith(new_read);
 
-  Value orig_input = generic_op.getInputs()[0];
   generic_op.erase();
   if (orig_input.use_empty())
     if (auto* orig_input_op = orig_input.getDefiningOp())
