@@ -741,8 +741,10 @@ struct ReductionLoopExposurePass
       if (stage == compute_stage) {
         if (failed(rewriteComputeStage(
                 rewriter, loc, ctx, stage, generic_op, one_row_tensor_type,
-                output_tensor_type, fifo_in, fifo_outs, fifo_in_partial,
-                is_first_chunk, dim_sizes, start, step, last_vals))) {
+                fifo_in, fifo_outs, fifo_in_partial, is_first_chunk, dim_sizes,
+                start, step, last_vals,
+                reduction_info.output_only_reduction_dims,
+                reduction_info.output_only_dim_sizes))) {
           return failure();
         }
       } else if (stage == conditional_store_stage) {
@@ -953,11 +955,12 @@ struct ReductionLoopExposurePass
   // Rewrite the compute stage with N nested scf.for loops (one per
   // reduction dim), each carrying the accumulator tensor as iter_arg.
   //
-  // The accumulator is always seeded with tensor.empty before the outermost
-  // loop.  Cross-chunk partial accumulation is the responsibility of the
+  // The accumulator is seeded before the outermost loop (an explicit
+  // arith.constant init is honored, else tensor.empty).  Cross-chunk partial
+  // accumulation is the responsibility of the
   // combine scf.if already present in the stage body.
   //
-  //   %seed = tensor.empty()
+  //   %seed = <outs init constant | tensor.empty()>
   //   scf.for %r0 = 0 to D0 iter_args(%a0 = %seed) {loop_type = reduction}
   //     ...
   //       %slice = ktdf.read_from_fifo fifo_in
@@ -967,15 +970,15 @@ struct ReductionLoopExposurePass
   //     ...
   //   scf.yield %r0_result
   // -------------------------------------------------------------------------
-  LogicalResult rewriteComputeStage(IRRewriter& rewriter, Location loc,
-                                    MLIRContext* ctx, ktdf::StageOp stage,
-                                    linalg::GenericOp generic_op,
-                                    RankedTensorType one_row_tensor_type,
-                                    RankedTensorType output_tensor_type,
-                                    Value fifo_in, ArrayRef<Value> fifo_outs,
-                                    Value fifo_in_partial, Value is_first_chunk,
-                                    ArrayRef<int64_t> dim_sizes, Value start,
-                                    Value step, ArrayRef<Value> last_vals) {
+  LogicalResult rewriteComputeStage(
+      IRRewriter& rewriter, Location loc, MLIRContext* ctx,
+      ktdf::StageOp stage, linalg::GenericOp generic_op,
+      RankedTensorType one_row_tensor_type, Value fifo_in,
+      ArrayRef<Value> fifo_outs, Value fifo_in_partial, Value is_first_chunk,
+      ArrayRef<int64_t> dim_sizes, Value start, Value step,
+      ArrayRef<Value> last_vals,
+      ArrayRef<int64_t> output_only_reduction_dims = {},
+      ArrayRef<int64_t> output_only_dim_sizes = {}) {
     Block* body = stage.getBody();
 
     // Collect existing ops to erase after the rewrite.
@@ -987,22 +990,49 @@ struct ReductionLoopExposurePass
     // already in front of the loops, and what reads its result is behind them.
     rewriter.setInsertionPoint(generic_op);
 
-    // Accumulator seed: always initialize with tensor.empty.
     const unsigned results = static_cast<unsigned>(generic_op.getNumResults());
 
-    SmallVector<Value> seeds;
+    // When the FIFO-fed operand is an outs() operand (empty ins()), the result
+    // at the same position is that tensor itself.  It is replaced by the
+    // per-iteration slice rather than carried, so it is not loop-carried.
+    const unsigned num_inputs = generic_op.getInputs().size();
+    const unsigned fifo_in_operand = *findFifoInOperandIdx(generic_op);
+    const bool fifo_in_is_out = fifo_in_operand >= num_inputs;
+    // Result number of the FIFO-fed tensor, or `results` (none) otherwise.
+    const unsigned fifo_in_result =
+        fifo_in_is_out ? fifo_in_operand - num_inputs : results;
+
+    // Result r -> index into the loop-carried values (-1 if not carried).
+    SmallVector<int> carry_idx(results, -1);
+    SmallVector<unsigned> carried;
     for (unsigned r = 0; r < results; ++r) {
-      seeds.push_back(
-          tensor::EmptyOp::create(rewriter, loc, output_tensor_type.getShape(),
-                                  output_tensor_type.getElementType())
-              .getResult());
+      if (r == fifo_in_result) continue;
+      carry_idx[r] = static_cast<int>(carried.size());
+      carried.push_back(r);
     }
 
-    // Build the nested loops, threading each accumulator through every level.
+    // Accumulator seeds: an explicit initial value (an arith.constant outs
+    // operand) is honored; otherwise initialize with tensor.empty, shaped like
+    // the generic's own output for that result.
+    SmallVector<Value> seeds;
+    for (unsigned r : carried) {
+      Value init = generic_op.getOutputs()[r];
+      if (init.getDefiningOp<arith::ConstantOp>()) {
+        seeds.push_back(init);
+        continue;
+      }
+      auto out_type = cast<RankedTensorType>(init.getType());
+      seeds.push_back(tensor::EmptyOp::create(rewriter, loc, out_type.getShape(),
+                                              out_type.getElementType())
+                          .getResult());
+    }
+
+    // Build the nested FIFO-driven loops, threading each accumulator through
+    // every level.
     auto nested =
         buildNestedForLoops(rewriter, loc, ctx, dim_sizes, start, step, seeds);
 
-    // Now populate the innermost loop body (before its yield).
+    // Now populate the innermost FIFO-driven loop body (before its yield).
     scf::ForOp innermost = nested.innermost_loop;
     Operation* inner_yield = innermost.getBody()->getTerminator();
 
@@ -1015,44 +1045,179 @@ struct ReductionLoopExposurePass
     auto slice = ktdf::ReadFromFifoOp::create(body_builder, loc,
                                               one_row_tensor_type, fifo_in);
 
-    // Clone the original linalg.generic, remapping its operands.
-    IRMapping mapping;
-    mapping.map(generic_op.getInputs().front(), slice.getResult());
-    for (unsigned r = 0; r < results; ++r) {
-      mapping.map(generic_op.getOutputs()[r], carries[r]);
-    }
-    auto new_generic = cast<linalg::GenericOp>(
-        body_builder.clone(*generic_op.getOperation(), mapping));
-    ValueRange updated = new_generic.getResults();
+    // -----------------------------------------------------------------------
+    // Output-only reduction dims (e.g. k-slots in top-k): build an inner
+    // scf.for nest around the linalg.generic clone.  Each loop iterates one
+    // such dimension, carries the corresponding accumulator tensors as
+    // iter_args, slices the k-spanning outputs to one slot per iteration, runs
+    // the generic with linalg.index N replaced by the loop IV, and inserts the
+    // result back into the full tensor.
+    //
+    // For dims NOT present in the k-spanning set (indexing map has no d_k),
+    // the full tensor is passed directly and updated in place each iteration —
+    // the last write (at k = K-1) wins, which is correct because those dims are
+    // updated identically for all k slots.
+    // -----------------------------------------------------------------------
+    const bool has_output_only_loops = !output_only_reduction_dims.empty();
 
-    // Replace the placeholder yield in the innermost loop with the real one.
-    for (unsigned r = 0; r < results; ++r) {
-      inner_yield->setOperand(r, updated[r]);
-    }
+    // After the k-loop nest is built (or direct clone if no output-only dims),
+    // `final_results[r]` holds the Value that represents result r after all
+    // k-iterations.
+    SmallVector<Value> final_results(results);
+
+    if (!has_output_only_loops) {
+      // No output-only loops: clone the generic directly in the expert loop,
+      // exactly as before.
+      IRMapping mapping;
+      mapping.map(getFifoInOperand(generic_op, fifo_in_operand),
+                  slice.getResult());
+      for (unsigned r : carried)
+        mapping.map(generic_op.getOutputs()[r], carries[carry_idx[r]]);
+      auto new_generic = cast<linalg::GenericOp>(
+          body_builder.clone(*generic_op.getOperation(), mapping));
+      if (fifo_in_is_out)
+        new_generic.getResult(fifo_in_result).setType(one_row_tensor_type);
+      for (unsigned r : carried)
+        final_results[r] = new_generic.getResult(r);
+    } else {
+      // Output-only dims present: tile the generic with tile_size = 1 for
+      // output-only reduction dims using mlir::linalg::tileLinalgOp.
+      IRMapping mapping;
+      mapping.map(getFifoInOperand(generic_op, fifo_in_operand),
+                  slice.getResult());
+      for (unsigned r : carried)
+        mapping.map(generic_op.getOutputs()[r], carries[carry_idx[r]]);
+      auto cloned_generic = cast<linalg::GenericOp>(
+          body_builder.clone(*generic_op.getOperation(), mapping));
+      if (fifo_in_is_out)
+        cloned_generic.getResult(fifo_in_result).setType(one_row_tensor_type);
+
+      SmallVector<int64_t> tile_sizes(cloned_generic.getNumLoops(), 0);
+      for (int64_t dim : output_only_reduction_dims)
+        tile_sizes[dim] = 1;
+
+      linalg::LinalgTilingOptions tiling_options;
+      tiling_options.setTileSizes(tile_sizes);
+      tiling_options.setLoopType(linalg::LinalgTilingLoopType::Loops);
+
+      IRRewriter tile_rewriter(body_builder);
+      auto maybe_tiling =
+          linalg::tileLinalgOp(tile_rewriter, cloned_generic, tiling_options);
+      if (failed(maybe_tiling)) {
+        return cloned_generic->emitError(
+            PASS_NAME ": failed to tile output-only reduction loops");
+      }
+
+      // Annotate created loops with reduction and output-only loop attributes.
+      for (Operation* loop_op : maybe_tiling->loops) {
+        loop_op->setAttr("loop_type",
+                         ktdf::LoopTypeAttr::get(ctx, ktdf::LoopType::ReductionLoop));
+        loop_op->setAttr("ktdf.output_only_loop", UnitAttr::get(ctx));
+      }
+
+      // Tile size is 1 on output-only dims, so linalg.index(d) within the tiled
+      // generic is always 0. Replace it with a constant 0 and fold the
+      // tiling-generated `affine.apply (d0 + d1)(index, iv)` down to iv.
+      // Only dims tiled with size 1 qualify: for a tile size T > 1 the index
+      // ranges over [0, T) and must be kept.
+      {
+        OpBuilder::InsertionGuard guard(tile_rewriter);
+        linalg::LinalgOp tiled = maybe_tiling->op;
+        SmallVector<linalg::IndexOp> index_ops;
+        tiled->walk([&](linalg::IndexOp idx_op) {
+          int64_t dim = static_cast<int64_t>(idx_op.getDim());
+          if (llvm::is_contained(output_only_reduction_dims, dim) &&
+              tile_sizes[dim] == 1)
+            index_ops.push_back(idx_op);
+        });
+        if (!index_ops.empty()) {
+          tile_rewriter.setInsertionPointToStart(tiled.getBlock());
+          Value zero =
+              arith::ConstantIndexOp::create(tile_rewriter, tiled.getLoc(), 0);
+          for (linalg::IndexOp idx_op : index_ops) {
+            SmallVector<Operation*> users(idx_op->getUsers());
+            tile_rewriter.replaceOp(idx_op, zero);
+            for (Operation* user : users) {
+              auto apply_op = dyn_cast<affine::AffineApplyOp>(user);
+              if (!apply_op) continue;
+              tile_rewriter.setInsertionPoint(apply_op);
+              OpFoldResult folded = affine::makeComposedFoldedAffineApply(
+                  tile_rewriter, apply_op.getLoc(), apply_op.getAffineMap(),
+                  getAsOpFoldResult(apply_op.getMapOperands()));
+              tile_rewriter.replaceOp(
+                  apply_op, getValueOrCreateConstantIndexOp(
+                                tile_rewriter, apply_op.getLoc(), folded));
+            }
+          }
+          if (zero.use_empty()) tile_rewriter.eraseOp(zero.getDefiningOp());
+        }
+      }
+
+      // Restore the FIFO operand of the tiled generic to slice.getResult()
+      // directly. tileLinalgOp treated outs operands as loop-carried destinations
+      // and generated extract_slice from loop iter_args, but the FIFO slice is
+      // constant across all k-iterations and fed directly by read_from_fifo.
+      if (fifo_in_is_out) {
+        Value old_init =
+            maybe_tiling->op.getDpsInitOperand(fifo_in_result)->get();
+        maybe_tiling->op.getDpsInitOperand(fifo_in_result)
+            ->set(slice.getResult());
+        if (auto ext = old_init.getDefiningOp<tensor::ExtractSliceOp>()) {
+          if (ext->use_empty()) ext->erase();
+        }
+        for (Operation* user : llvm::make_early_inc_range(
+                 maybe_tiling->op->getResult(fifo_in_result).getUsers())) {
+          if (auto ins = dyn_cast<tensor::InsertSliceOp>(user)) {
+            ins.getResult().replaceAllUsesWith(ins.getDest());
+            ins.erase();
+          }
+        }
+      } else {
+        Value old_in =
+            maybe_tiling->op.getDpsInputOperand(fifo_in_operand)->get();
+        maybe_tiling->op.getDpsInputOperand(fifo_in_operand)
+            ->set(slice.getResult());
+        if (auto ext = old_in.getDefiningOp<tensor::ExtractSliceOp>()) {
+          if (ext->use_empty()) ext->erase();
+        }
+      }
+
+      // Erase the intermediate cloned generic that was tiled.
+      cloned_generic->erase();
+
+      for (unsigned r : carried)
+        final_results[r] = maybe_tiling->tensorResults[r];
+    }  // end has_output_only_loops
+
+    // Replace the placeholder yield in the expert (FIFO-driven) innermost loop
+    // with the actual accumulated values.
+    for (unsigned r : carried)
+      inner_yield->setOperand(carry_idx[r], final_results[r]);
 
     rewriter.setInsertionPointAfter(nested.outermost_loop);
 
-    SmallVector<Value> final_results;
-    for (unsigned r = 0; r < results; ++r)
-      final_results.push_back(nested.outermost_loop.getResult(r));
-
-    if (fifo_outs.front()) {
-      // Emit the guarded writes on the last iteration inside the innermost
-      // loop.
-      Value is_last = buildAllLast(body_builder, loc, nested.ivs, last_vals);
-      auto last_if = scf::IfOp::create(body_builder, loc, TypeRange{}, is_last,
+    const bool writes_fifo =
+        llvm::any_of(fifo_outs, [](Value slot) { return slot != Value{}; });
+    if (writes_fifo) {
+      // Emit the guarded writes on the last expert iteration inside the
+      // innermost expert loop.  Results without a FIFO slot are loop-carried.
+      OpBuilder after_builder(inner_yield);
+      Value is_last = buildAllLast(after_builder, loc, nested.ivs, last_vals);
+      auto last_if = scf::IfOp::create(after_builder, loc, TypeRange{}, is_last,
                                        /*withElseRegion=*/false);
       OpBuilder then_builder(last_if.getThenRegion().front().getTerminator());
-      for (unsigned r = 0; r < results; ++r) {
-        ktdf::WriteToFifoOp::create(then_builder, loc, updated[r],
+      for (unsigned r : carried) {
+        if (!fifo_outs[r]) continue;
+        ktdf::WriteToFifoOp::create(then_builder, loc, final_results[r],
                                     fifo_outs[r]);
       }
     } else {
       // The generic's result feeds other ops (e.g. a downstream inner-dim
       // reduction). Replace all uses of the original generic with the
       // final results.
-      for (unsigned r = 0; r < results; ++r) {
-        generic_op.getResult(r).replaceAllUsesWith(final_results[r]);
+      for (unsigned r : carried) {
+        generic_op.getResult(r).replaceAllUsesWith(
+            nested.outermost_loop.getResult(carry_idx[r]));
       }
       // write_to_fifo has no results so use_empty() is always true; exclude
       // it from the erase list so it is preserved together with the ops that
