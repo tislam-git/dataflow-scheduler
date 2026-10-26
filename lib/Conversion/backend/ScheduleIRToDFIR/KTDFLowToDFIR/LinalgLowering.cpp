@@ -536,18 +536,77 @@ struct LowerLinalgGenericPattern
                           mlir::AffineMap::getMultiDimIdentityMap(rank, ctx)};
   }
 
+  /// Spreads a scalar constant over every lane of \p vector_type:
+  ///   vectorchain.constant_bitstream {value = [bits]} : vector<1xT>
+  ///   vectorchain.shuffle {indices = [0], repetition = N} : vector<NxT>
+  ///
+  /// This is how linalg.fill materializes a constant too. A scalar that is not
+  /// a constant has no bits to write into a bitstream, so it is left alone and
+  /// the caller fails the match.
+  static std::optional<mlir::Value> splatScalarConstant(
+      mlir::PatternRewriter& rewriter, mlir::Location loc, mlir::Value scalar,
+      mlir::VectorType vector_type) {
+    mlir::Attribute value;
+    auto* const def = scalar.getDefiningOp();
+    if (!def || !mlir::m_Constant(&value).match(def)) return std::nullopt;
+
+    llvm::APInt bits;
+    if (const auto attr = mlir::dyn_cast<mlir::FloatAttr>(value)) {
+      bits = attr.getValue().bitcastToAPInt();
+    } else if (const auto attr = mlir::dyn_cast<mlir::IntegerAttr>(value)) {
+      bits = attr.getValue();
+    } else {
+      return std::nullopt;
+    }
+    if (bits.getBitWidth() > 64) return std::nullopt;
+    bits = bits.zext(64U);
+
+    const mlir::Type elem_type = vector_type.getElementType();
+    if (scalar.getType() != elem_type) return std::nullopt;
+
+    auto bitstream = mlir::vectorchain::ConstantBitstreamOp::create(
+        rewriter, loc, mlir::VectorType::get({1}, elem_type),
+        rewriter.getArrayAttr(
+            {mlir::IntegerAttr::get(rewriter.getI64Type(), bits)}));
+    auto shuffle = mlir::vectorchain::ShuffleOp::create(
+        rewriter, loc, vector_type, bitstream.getResult(),
+        /*variable=*/mlir::ValueRange{}, /*pad=*/mlir::ValueRange{},
+        /*mask=*/nullptr, /*dbgName=*/nullptr,
+        rewriter.getArrayAttr(
+            {mlir::IntegerAttr::get(rewriter.getI32Type(), 0)}),
+        static_cast<uint32_t>(vector_type.getNumElements()));
+    return shuffle.getOutput();
+  }
+
   // Unified helper: lowers any two-operand arith float op to
   // vectorchain.binary with the given binary_kind.
+  //
+  // One side may be a scalar constant (for instance the 1.0 a counter is
+  // incremented by). The unit works on whole vectors, so it is spread over the
+  // lanes of the other side first.
   mlir::LogicalResult lowerBinaryFOp(
       mlir::Operation* op, mlir::Value lhs, mlir::Value rhs,
       mlir::PatternRewriter& rewriter, mlir::AffineMap identity_map,
       mlir::vectorchain::VectorChainBinaryOperator binary_kind) const {
-    const auto lhs_ty = llvm::dyn_cast<mlir::ShapedType>(lhs.getType());
-    if (!lhs_ty) {
+    auto lhs_ty = llvm::dyn_cast<mlir::ShapedType>(lhs.getType());
+    auto rhs_ty = llvm::dyn_cast<mlir::ShapedType>(rhs.getType());
+    if (!lhs_ty && !rhs_ty) {
       return llvm::failure();
     }
-    auto vector_type = getFlattenedVectorType(lhs_ty);
+    auto vector_type = getFlattenedVectorType(lhs_ty ? lhs_ty : rhs_ty);
     if (!vector_type) return mlir::failure();
+
+    for (mlir::Value* operand : {&lhs, &rhs}) {
+      if (llvm::isa<mlir::ShapedType>(operand->getType())) continue;
+      const auto splat = splatScalarConstant(rewriter, op->getLoc(), *operand,
+                                             vector_type);
+      if (!splat) {
+        return rewriter.notifyMatchFailure(
+            op, "scalar operand is not a constant of the vector's element "
+                "type");
+      }
+      *operand = *splat;
+    }
 
     auto binary_op = mlir::vectorchain::BinaryOp::create(
         rewriter, op->getLoc(), vector_type, lhs, rhs,
