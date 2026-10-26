@@ -534,6 +534,19 @@ struct ReductionLoopExposurePass
     // factor R = product(dim_sizes[]) is used only for FIFO resizing.
     ReductionInfo reduction_info;
     if (!collectReductionInfo(generic_op, reduction_info)) return success();
+
+    // An FIFO-fed tensor held in outs() is replaced by the per-iteration
+    // slice, so its result cannot be consumed.  Reject before mutating
+    // anything.
+    {
+      unsigned fifo_in_operand = *findFifoInOperandIdx(generic_op);
+      unsigned num_inputs = generic_op.getInputs().size();
+      if (fifo_in_operand >= num_inputs &&
+          !generic_op.getResult(fifo_in_operand - num_inputs).use_empty()) {
+        return generic_op.emitError(
+            PASS_NAME ": the result of the FIFO-fed operand is used");
+      }
+    }
     SmallVector<int64_t>& reduction_dims = reduction_info.reduction_dims;
     SmallVector<int64_t>& dim_sizes = reduction_info.dim_sizes;
     int64_t reduction_size = reduction_info.reduction_size;
@@ -669,7 +682,8 @@ struct ReductionLoopExposurePass
     // first (e.g. a second-stage inner-dim reduction after SplitReduction),
     // this will be null and we take the non-FIFO path in rewriteComputeStage.
     // One per result: a compute reducing a pair writes each half to a slot of
-    // its own. All null or all found -- a mix is a shape this does not know.
+    // its own.  A result without a write_to_fifo (e.g. a top-k whose counter
+    // or passthrough results are dead) stays null and is only loop-carried.
     SmallVector<Value> fifo_outs(generic_op.getNumResults());
     for (unsigned r = 0; r < generic_op.getNumResults(); ++r) {
       for (Operation* user : generic_op.getResult(r).getUsers()) {
@@ -679,27 +693,14 @@ struct ReductionLoopExposurePass
         }
       }
     }
-    const bool writes_fifo = fifo_outs.front() != Value{};
-    if (llvm::any_of(fifo_outs, [&](Value slot) {
-          return (slot != Value{}) != writes_fifo;
-        })) {
-      return generic_op.emitError(PASS_NAME
-                                  ": some results are written to a fifo and "
-                                  "some are not");
-    }
 
-    // Output accumulator tensor type (from the generic's output). One per
-    // result, and the same for each.
-    auto output_tensor_type =
-        cast<RankedTensorType>(generic_op.getOutputs().front().getType());
-
-    // Per-iteration input slice tensor: same shape as the generic input but
-    // size-1 in every reduction dimension.
+    // Per-iteration input slice tensor: same shape as the generic's data
+    // operand but size-1 in every reduction dimension.
     // Example: input [1, 256, 64] with reduction dims [1] → slice [1, 1, 64].
     // For non-contiguous reduction dims (e.g. [0, 2] of [d0, d1, d2]) both
     // axes independently become 1, e.g. [1, d1, 1].
-    auto slice_tensor_type =
-        cast<RankedTensorType>(generic_op.getInputs().front().getType());
+    auto slice_tensor_type = cast<RankedTensorType>(
+        getFifoInOperand(generic_op, *findFifoInOperandIdx(generic_op)).getType());
     SmallVector<int64_t> slice_shape(slice_tensor_type.getShape().begin(),
                                      slice_tensor_type.getShape().end());
     for (int64_t reduction_dim : reduction_dims)
