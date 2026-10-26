@@ -121,11 +121,10 @@ static bool isEligible(linalg::GenericOp generic_op) {
     if (it == utils::IteratorType::reduction) ++num_reductions;
   if (num_reductions < 2) return false;
 
-  // Condition 2: check that the rightmost input dimension maps to a reduction
-  // loop dim (via the input's indexing map).
-  auto input_type =
-      dyn_cast<RankedTensorType>(generic_op.getInputs().front().getType());
-  if (!input_type) return false;
+  // Condition 2 guarded: skip output-only generics (empty ins()) which do
+  // not have an input tensor to inspect; they are handled by
+  // ReductionLoopExposure's output-only loop path.
+  if (generic_op.getInputs().empty()) return false;
 
   AffineMap input_map = generic_op.getIndexingMapsArray().front();
   unsigned last = input_map.getNumResults() - 1;
