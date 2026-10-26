@@ -639,8 +639,40 @@ struct LowerLinalgGenericPattern
     return mlir::success();
   }
 
+  /// Spreads a scalar condition over every lane of a vector of i1:
+  ///   vectorchain.constant_bitstream {value = [0]} : vector<1xi1>
+  ///   vectorchain.shuffle input(%seed), pad(%condition)
+  ///       {indices = [-1], repetition = N} : vector<Nxi1>
+  ///
+  /// The condition is only known at run time (for instance a test of a loop
+  /// index), so unlike splatScalarConstant it has no bits to write into the
+  /// bitstream. A shuffle names a scalar pad operand by a negative index
+  /// instead; the bitstream is only the input the shuffle requires.
+  static mlir::Value splatScalarCondition(mlir::PatternRewriter& rewriter,
+                                          mlir::Location loc,
+                                          mlir::Value condition,
+                                          int64_t lanes) {
+    const mlir::Type bool_type = rewriter.getI1Type();
+    auto seed = mlir::vectorchain::ConstantBitstreamOp::create(
+        rewriter, loc, mlir::VectorType::get({1}, bool_type),
+        rewriter.getArrayAttr(
+            {mlir::IntegerAttr::get(rewriter.getI64Type(), 0)}));
+    auto shuffle = mlir::vectorchain::ShuffleOp::create(
+        rewriter, loc, mlir::VectorType::get({lanes}, bool_type),
+        seed.getResult(), /*variable=*/mlir::ValueRange{},
+        /*pad=*/mlir::ValueRange{condition},
+        /*mask=*/nullptr, /*dbgName=*/nullptr,
+        rewriter.getArrayAttr(
+            {mlir::IntegerAttr::get(rewriter.getI32Type(), -1)}),
+        static_cast<uint32_t>(lanes));
+    return shuffle.getOutput();
+  }
+
   /// Lowers \p op to an element-wise selection, taking a lane from one side or
   /// the other by the mask a compare left.
+  ///
+  /// A condition that is a scalar i1 holds for every lane alike, so it is
+  /// spread over the lanes first.
   mlir::LogicalResult lowerSelectOp(mlir::arith::SelectOp op,
                                     mlir::PatternRewriter& rewriter) const {
     const auto picked =
@@ -649,8 +681,14 @@ struct LowerLinalgGenericPattern
     auto result = getFlattenedVectorType(picked);
     if (!result) return mlir::failure();
 
+    mlir::Value condition = op.getCondition();
+    if (!llvm::isa<mlir::ShapedType>(condition.getType())) {
+      condition = splatScalarCondition(rewriter, op->getLoc(), condition,
+                                       result.getNumElements());
+    }
+
     auto selection_op = mlir::vectorchain::ElementWiseSelectionOp::create(
-        rewriter, op->getLoc(), result, op.getCondition(), op.getTrueValue(),
+        rewriter, op->getLoc(), result, condition, op.getTrueValue(),
         op.getFalseValue(), /*mask=*/nullptr, /*dbgName=*/nullptr);
 
     rewriter.replaceOp(op, selection_op.getData());
