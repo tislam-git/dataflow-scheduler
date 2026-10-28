@@ -276,6 +276,32 @@ struct LowerLinalgGenericPattern
       return mlir::failure();
     }
 
+    // Turn away a body op that will not lower before anything is rewritten.
+    // Failing part-way leaves the replaced block arguments behind, and the
+    // body ops still using them no longer type-check, so the verifier reports
+    // that instead of the reason. The body loop below keeps its own check for
+    // the same op; this one only has to run first.
+    //
+    // It is an error and not a match failure: the greedy driver reads a match
+    // failure as "this pattern does not apply" and carries on, so the generic
+    // would stay in the IR with its fifo read replaced by a vector, and the
+    // verifier would report that instead of the reason.
+    //
+    // Future improvement: this only covers the rejections listed here, so any
+    // other body op that fails part-way (e.g. an unsupported op, or a scalar
+    // operand that is not a constant) still leaves the block arguments
+    // replaced. A general fix is to build the lowered body on a clone of the
+    // generic and swap it in only once every op has lowered, so a failure
+    // leaves the original IR untouched and this scan is no longer needed.
+    for (mlir::Operation& op : body.without_terminator()) {
+      auto maxnum_op = mlir::dyn_cast<mlir::arith::MaxNumFOp>(op);
+      mlir::Value abs_lhs, abs_rhs;
+      if (maxnum_op && !matchAbsMaxOperands(maxnum_op, abs_lhs, abs_rhs)) {
+        return maxnum_op.emitError(
+            "maxnumf outside the abs-max shape is not lowered");
+      }
+    }
+
     // Replace input block arguments with their corresponding linalg ins
     // operands.  The body's ops become vectorchain ops, so each operand has to
     // reach them as a vector.

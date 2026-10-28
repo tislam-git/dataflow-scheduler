@@ -9,7 +9,10 @@
 // absf(x) maxnumf absf(y) still lowers, to abs_max; linalg-maxnumf-lowering covers
 // it.
 
-// CHECK: error: failed to run operation lowerings for maxnumf_plain
+// The lowering refuses it before rewriting anything. The generic is left where it
+// is once refused, so what cannot be lowered after it reports too. Only the first
+// message is the one under test.
+// CHECK: error: maxnumf outside the abs-max shape is not lowered
 
 #map_in  = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 #map_out = affine_map<(d0, d1, d2) -> (d0, d2)>
