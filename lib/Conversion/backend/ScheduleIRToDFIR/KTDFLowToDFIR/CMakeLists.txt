@@ -1,4 +1,5 @@
 add_dataflow_scheduler_library(DataflowSchedulerKTDFLowToDFIR
+    FoldSubViews.cpp
     KTDFLowToDFIR.cpp
     LogicalMemoryViewBuilder.cpp
     OperationLowerings.cpp
@@ -44,6 +45,7 @@ add_dataflow_scheduler_library(DataflowSchedulerKTDFLowToDFIR
     MLIRArithDialect
     MLIRFuncDialect
     MLIRIR
+    MLIRMemRefDialect
     MLIRMathDialect
     MLIRPass
     MLIRSCFDialect

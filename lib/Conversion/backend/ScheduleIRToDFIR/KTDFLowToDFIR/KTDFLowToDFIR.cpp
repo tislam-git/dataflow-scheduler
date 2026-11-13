@@ -25,6 +25,7 @@
 #include <mlir/Transforms/RegionUtils.h>
 
 #include "dataflow-scheduler/Analysis/ArchViews/MemoryTree.h"
+#include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/FoldSubViews.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/LogicalMemoryViewBuilder.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/OperationLowerings.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/PreludeWorkPartition.h"
@@ -160,6 +161,13 @@ struct KTDFLowToDFIRPass
                                              components, mapping, symbols))) {
         func.emitError("failed to run operation lowerings for ")
             << func.getName();
+        return signalPassFailure();
+      }
+
+      // The lowerings leave memref.subview between a memory view and the
+      // agen accesses of it, which DFIR cannot express: fold them into the
+      // accesses' subscripts.
+      if (mlir::failed(foldSubViewsIntoAgenAccesses(func))) {
         return signalPassFailure();
       }
 
