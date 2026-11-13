@@ -339,6 +339,35 @@ def AccessGranularityLegalizationPass
   let constructor = "::scheduler::createAccessGranularityLegalizationPass()";
 }
 
+def ChunkWideAccessesPass
+    : Pass<"chunk-wide-accesses", "mlir::ModuleOp"> {
+  let summary = "Split FIFO accesses wider than the throttle into a loop of throttle-sized accesses";
+  let description = [{
+    Finds every `ktdf.fifo.slot` allocated by a `ktdf.private` that holds more
+    elements than the throttle -- the SIMD lane count of the default compute
+    unit for the slot's element type. Such a slot is lowered to an
+    `agen.vector_load` / `agen.vector_store` plus a `dataflow.send` /
+    `dataflow.receive` of the whole slot, which the hardware cannot issue.
+
+    The slot is shrunk to the throttle, and each access to it -- a
+    `ktdf.write_to_fifo` or `ktdf.read_from_fifo` of a memref, or a
+    `ktdf.data_transfer` between the slot and a memref -- is replaced by a
+    throttle-sized `ktdf.data_transfer` enclosed in an `scf.for` nest that
+    covers the original extent. The pieces, in loop order, are consecutive in
+    row-major order of the original access, so both ends of the slot stay in
+    step even when they are shaped differently.
+
+    All the accesses of a slot are split together. A slot that cannot be split
+    this way is diagnosed.
+  }];
+  let constructor = "::scheduler::createChunkWideAccessesPass()";
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::ktdf::KTDFDialect",
+    "mlir::scf::SCFDialect"
+  ];
+}
+
 def IndirectAddrBufFillLegalizationPass
     : Pass<"indirect-addr-buf-fill-legalization", "mlir::ModuleOp"> {
   let summary = "Stage indirect address buffer fills through a reachable memory";

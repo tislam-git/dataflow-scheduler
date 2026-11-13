@@ -146,6 +146,11 @@ void scheduler::buildSchedulerOptimizationPipeline(
   // With the consumers in their final form, write each FIFO's slots in the
   // order the consumer uses them, as the FIFO delivers them in that order.
   pm.addPass(createOrderFifoSlotsByUsePass());
+  // A FIFO slot wider than the throttle would be sent or received at once by
+  // an access the hardware cannot issue; cut it, and its accesses, into
+  // throttle-sized ones. After the reordering above, whose protocol looks for
+  // the accesses of a slot in one block, and before addresses are assigned.
+  pm.addPass(createChunkWideAccessesPass());
 
   pm.addPass(createAddressAssignmentPass(scheduler_ctx));
   // TODO: position of cross-instance parallelization is TBD

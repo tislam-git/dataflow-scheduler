@@ -11,6 +11,7 @@ add_dataflow_scheduler_library(DataflowSchedulerTransforms
     IndirectAccessLoopMaterialization.cpp
     AffineMinCanonicalization.cpp
     ApplyDevicePatterns.cpp
+    ChunkWideAccesses.cpp
     DoubleBuffering.cpp
     EnsureDeviceDeclaration.cpp
     FoldFifoRelayStages.cpp
