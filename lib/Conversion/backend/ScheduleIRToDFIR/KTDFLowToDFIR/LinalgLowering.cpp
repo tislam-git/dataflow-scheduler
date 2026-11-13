@@ -239,7 +239,7 @@ struct LowerLinalgGenericPattern
                 return lowerIdentity(op, rewriter, identity_map);
               })
               .Case<mlir::memref::StoreOp>([&](mlir::memref::StoreOp op) {
-                return lowerMemRefStore(op, rewriter);
+                return lowerMemRefStore(op, generic_op, rewriter);
               })
               .Case<mlir::memref::LoadOp>([&](mlir::memref::LoadOp op) {
                 return lowerMemRefLoad(op, rewriter);
@@ -258,11 +258,40 @@ struct LowerLinalgGenericPattern
   }
 
  private:
+  /// Returns whether `val` is produced by a FIFO operation (or derived from
+  /// one through casts / shuffles).
+  static bool isFifoValue(mlir::Value val) {
+    while (val) {
+      if (val.getDefiningOp<mlir::ktdf::ReadFromFifoOp>()) return true;
+      if (val.getDefiningOp<mlir::dataflow::ReceiveOp>()) return true;
+      if (auto shuffle = val.getDefiningOp<mlir::vectorchain::ShuffleOp>()) {
+        val = shuffle.getInput();
+        continue;
+      }
+      if (auto cast_op = val.getDefiningOp<mlir::memref::MemorySpaceCastOp>()) {
+        val = cast_op.getSource();
+        continue;
+      }
+      if (auto cast_op =
+              val.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+        if (cast_op.getInputs().size() == 1) {
+          val = cast_op.getInputs()[0];
+          continue;
+        }
+      }
+      if (auto subview = val.getDefiningOp<mlir::memref::SubViewOp>()) {
+        val = subview.getSource();
+        continue;
+      }
+      break;
+    }
+    return false;
+  }
+
   /// Whether \p operand is a fifo read, or the vector that read was replaced
   /// by: a value rather than a buffer.
   static bool isFifoFed(mlir::Value operand) {
-    return !mlir::isa<mlir::MemRefType>(operand.getType()) ||
-           operand.getDefiningOp<mlir::ktdf::ReadFromFifoOp>();
+    return isFifoValue(operand);
   }
 
   // Lowers a linalg.generic with buffer semantics (memref init operand).
@@ -331,7 +360,7 @@ struct LowerLinalgGenericPattern
       if (block_arg.use_empty()) continue;
       mlir::Value operand = input;
       auto memref_type = mlir::dyn_cast<mlir::MemRefType>(input.getType());
-      if (memref_type && !input.getDefiningOp<mlir::ktdf::ReadFromFifoOp>()) {
+      if (memref_type && !isFifoValue(input)) {
         mlir::VectorType vec_type = getFlattenedVectorType(memref_type);
         if (!vec_type) return mlir::failure();
         operand = scheduler::emitVectorLoad(rewriter, loc, vec_type, input);
@@ -350,16 +379,31 @@ struct LowerLinalgGenericPattern
     // also not written back below -- there is no buffer behind it. Once that
     // read has been replaced the output is the vector itself, which is the
     // same case.
-    llvm::SmallVector<mlir::Value> out_memrefs;
+    llvm::SmallVector<mlir::Value> dest_buffers(accumulators, nullptr);
     for (unsigned r = 0; r < accumulators; ++r) {
       mlir::Value out_memref = generic_op.getDpsInitOperand(r)->get();
-      out_memrefs.push_back(out_memref);
 
       mlir::BlockArgument acc_arg = body.getArgument(num_inputs + r);
-      if (acc_arg.use_empty()) continue;
 
       if (isFifoFed(out_memref)) {
-        rewriter.replaceAllUsesWith(acc_arg, out_memref);
+        mlir::memref::StoreOp fifo_store = nullptr;
+        for (mlir::Operation& op : body.without_terminator()) {
+          if (auto store_op = mlir::dyn_cast<mlir::memref::StoreOp>(op)) {
+            if (store_op.getValueToStore() == acc_arg ||
+                store_op.getValueToStore() == out_memref ||
+                isFifoValue(store_op.getValueToStore())) {
+              fifo_store = store_op;
+              break;
+            }
+          }
+        }
+
+        if (fifo_store) {
+          dest_buffers[r] = fifo_store.getMemRef();
+        }
+        if (!acc_arg.use_empty()) {
+          rewriter.replaceAllUsesWith(acc_arg, out_memref);
+        }
         continue;
       }
 
@@ -367,9 +411,12 @@ struct LowerLinalgGenericPattern
       auto acc_vec_type = getFlattenedVectorType(out_memref_type);
       if (!acc_vec_type) return mlir::failure();
 
-      rewriter.replaceAllUsesWith(
-          acc_arg,
-          scheduler::emitVectorLoad(rewriter, loc, acc_vec_type, out_memref));
+      dest_buffers[r] = out_memref;
+      if (!acc_arg.use_empty()) {
+        rewriter.replaceAllUsesWith(
+            acc_arg,
+            scheduler::emitVectorLoad(rewriter, loc, acc_vec_type, out_memref));
+      }
     }
 
     mlir::AffineMap identity_map =
@@ -418,7 +465,7 @@ struct LowerLinalgGenericPattern
                 return lowerIdentity(op, rewriter, identity_map);
               })
               .Case<mlir::memref::StoreOp>([&](mlir::memref::StoreOp op) {
-                return lowerMemRefStore(op, rewriter);
+                return lowerMemRefStore(op, generic_op, rewriter);
               })
               .Case<mlir::memref::LoadOp>([&](mlir::memref::LoadOp op) {
                 return lowerMemRefLoad(op, rewriter);
@@ -463,12 +510,11 @@ struct LowerLinalgGenericPattern
       if (mlir::failed(result)) return mlir::failure();
     }
 
-    // Write each accumulated vector back to the buffer it came from. A fifo
-    // read has no buffer to write back to.
+    // Write each accumulated vector back to the buffer it came from.
     for (unsigned r = 0; r < accumulators; ++r) {
-      if (isFifoFed(out_memrefs[r])) continue;
+      if (!dest_buffers[r]) continue;
       scheduler::emitVectorStore(rewriter, loc, yield_op.getOperand(r),
-                                 out_memrefs[r]);
+                                 dest_buffers[r]);
     }
 
     rewriter.eraseOp(generic_op);
@@ -517,6 +563,7 @@ struct LowerLinalgGenericPattern
   /// this runs. Returns failure while it is still the body's scalar, so the
   /// driver comes back to it.
   mlir::LogicalResult lowerMemRefStore(mlir::memref::StoreOp op,
+                                       mlir::linalg::GenericOp generic_op,
                                        mlir::PatternRewriter& rewriter) const {
     if (!mlir::isa<mlir::VectorType>(op.getValueToStore().getType())) {
       return mlir::failure();
@@ -525,8 +572,26 @@ struct LowerLinalgGenericPattern
     const auto access = getRegisterAccess(op.getMemRef());
     if (!access) return mlir::failure();
 
+    mlir::Value val = op.getValueToStore();
+    mlir::Operation* def_op = val.getDefiningOp();
+    mlir::OpBuilder::InsertionGuard guard(rewriter);
+    if (def_op && isFifoValue(val)) {
+      mlir::Block* generic_block =
+          generic_op ? generic_op->getBlock() : op->getBlock();
+      if (def_op->getBlock() != generic_block) {
+        mlir::Operation* insert_after = def_op;
+        if (auto* memref_def = op.getMemRef().getDefiningOp()) {
+          if (memref_def->getBlock() == def_op->getBlock() &&
+              def_op->isBeforeInBlock(memref_def)) {
+            insert_after = memref_def;
+          }
+        }
+        rewriter.setInsertionPointAfter(insert_after);
+      }
+    }
+
     mlir::agen::VectorStoreOp::create(
-        rewriter, op.getLoc(), op.getValueToStore(), op.getMemRef(),
+        rewriter, op.getLoc(), val, op.getMemRef(),
         /*dbgName=*/nullptr, access->map, op.getIndices(), access->set,
         access->order);
     rewriter.eraseOp(op);
