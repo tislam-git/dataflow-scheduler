@@ -742,8 +742,7 @@ struct ReductionLoopExposurePass
         if (failed(rewriteComputeStage(
                 rewriter, loc, ctx, stage, generic_op, one_row_tensor_type,
                 fifo_in, fifo_outs, fifo_in_partial, is_first_chunk, dim_sizes,
-                start, step, last_vals,
-                reduction_info.output_only_reduction_dims,
+                start, step, reduction_info.output_only_reduction_dims,
                 reduction_info.output_only_dim_sizes))) {
           return failure();
         }
@@ -965,10 +964,10 @@ struct ReductionLoopExposurePass
   //     ...
   //       %slice = ktdf.read_from_fifo fifo_in
   //       %updated = linalg.generic(%slice, %aInner)
-  //       if (all ivs == last): ktdf.write_to_fifo %updated, fifo_out
   //       scf.yield %updated
   //     ...
   //   scf.yield %r0_result
+  //   ktdf.write_to_fifo %r0_result_final, fifo_out
   // -------------------------------------------------------------------------
   LogicalResult rewriteComputeStage(
       IRRewriter& rewriter, Location loc, MLIRContext* ctx,
@@ -976,7 +975,6 @@ struct ReductionLoopExposurePass
       RankedTensorType one_row_tensor_type, Value fifo_in,
       ArrayRef<Value> fifo_outs, Value fifo_in_partial, Value is_first_chunk,
       ArrayRef<int64_t> dim_sizes, Value start, Value step,
-      ArrayRef<Value> last_vals,
       ArrayRef<int64_t> output_only_reduction_dims = {},
       ArrayRef<int64_t> output_only_dim_sizes = {}) {
     Block* body = stage.getBody();
@@ -1199,16 +1197,13 @@ struct ReductionLoopExposurePass
     const bool writes_fifo =
         llvm::any_of(fifo_outs, [](Value slot) { return slot != Value{}; });
     if (writes_fifo) {
-      // Emit the guarded writes on the last expert iteration inside the
-      // innermost expert loop.  Results without a FIFO slot are loop-carried.
-      OpBuilder after_builder(inner_yield);
-      Value is_last = buildAllLast(after_builder, loc, nested.ivs, last_vals);
-      auto last_if = scf::IfOp::create(after_builder, loc, TypeRange{}, is_last,
-                                       /*withElseRegion=*/false);
-      OpBuilder then_builder(last_if.getThenRegion().front().getTerminator());
+      // Write the final accumulated values right after the reduction loop nest
+      // (insertion point set above).
+      // Results without a FIFO slot stay loop-carried.
       for (unsigned r : carried) {
         if (!fifo_outs[r]) continue;
-        ktdf::WriteToFifoOp::create(then_builder, loc, final_results[r],
+        ktdf::WriteToFifoOp::create(rewriter, loc,
+                                    nested.outermost_loop.getResult(carry_idx[r]),
                                     fifo_outs[r]);
       }
     } else {
